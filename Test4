@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+# lorawan_abp_single.py
+# One file: Semtech UDP gateway + ABP end device (LoRaWAN 1.0.x)
+
+import socket, json, time, base64, struct, secrets, threading, random
+from datetime import datetime, timezone
+from binascii import hexlify
+from Crypto.Cipher import AES
+from Crypto.Hash import CMAC
+
+# ===================== USER CONFIG (EDIT) =====================
+TTN_SERVER = "learningnetwork.ms1.cloud.thethings.industries"  # your TTS UDP router
+PORT       = 1700
+
+# Simulated Gateway EUI (MSB, 16 hex chars)
+GATEWAY_EUI_HEX = "0004A30B001CC532"
+
+# ------------ ABP device session keys (MSB, from TTS) ----------
+# Register the device in TTS as ABP (MAC v1.0.3, RP002 A), then copy these:
+DEVADDR_HEX = "260B1234"                                      # 4 bytes
+NWK_SKEY_HEX = "11223344556677889900AABBCCDDEEFF"             # 16 bytes
+APP_SKEY_HEX = "FFEEDDCCBBAA00998877665544332211"             # 16 bytes
+
+# Region/radio (AS923 example; change to match your plan)
+FREQUENCIES_MHZ = [922.0, 922.2, 922.4, 922.6, 922.8]
+DATARATE        = "SF7BW125"
+CODR            = "4/5"
+RSSI, LSNR      = -35, 5.0
+VERBOSE         = True
+# =============================================================
+
+# ---------- helpers ----------
+def b64e(b): return base64.b64encode(b).decode("ascii")
+def b64d(s): return base64.b64decode(s + "===")
+
+GATEWAY_EUI = bytes.fromhex(GATEWAY_EUI_HEX)
+DEVADDR     = bytes.fromhex(DEVADDR_HEX)          # MSB in config
+NWK_SKEY    = bytes.fromhex(NWK_SKEY_HEX)
+APP_SKEY    = bytes.fromhex(APP_SKEY_HEX)
+
+print(f"[INFO] DevAddr={DEVADDR_HEX}  NwkSKey={NWK_SKEY_HEX}  AppSKey={APP_SKEY_HEX}")
+
+# UDP socket
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2.0)
+
+# Semtech UDP constants
+VER=2; PUSH_DATA=0x00; PUSH_ACK=0x01; PULL_DATA=0x02; PULL_RESP=0x03; PULL_ACK=0x04; TX_ACK=0x05
+
+# ---------- LoRaWAN payload building (ABP) ----------
+def encrypt_frm(app_skey: bytes, dev_addr: bytes, payload: bytes, fcnt: int) -> bytes:
+    out = bytearray(); cipher = AES.new(app_skey, AES.MODE_ECB)
+    i = 1; dev_le = dev_addr[::-1]
+    while len(out) < len(payload):
+        block_a = (b"\x01" + b"\x00"*4 + b"\x00" + dev_le +
+                   fcnt.to_bytes(4, "little") + b"\x00" + bytes([i]))
+        s = cipher.encrypt(block_a)
+        for b in payload[(i-1)*16:i*16]:
+            out.append(b ^ s[len(out)%16])
+        i += 1
+    return bytes(out[:len(payload)])
+
+def mic(nwk_skey: bytes, dev_addr: bytes, mhdr_mac: bytes, fcnt: int) -> bytes:
+    dev_le = dev_addr[::-1]
+    b0 = (b"\x49" + b"\x00"*4 + b"\x00" + dev_le +
+          fcnt.to_bytes(4, "little") + b"\x00" + bytes([len(mhdr_mac)]))
+    c = CMAC.new(nwk_skey, ciphermod=AES); c.update(b0 + mhdr_mac)
+    return c.digest()[:4]
+
+def build_uplink(plaintext: bytes, fcnt: int, confirmed=False) -> bytes:
+    mhdr = b"\x80" if confirmed else b"\x40"     # Confirmed/Unconfirmed Data Up
+    fctrl = b"\x80"                               # ADR bit set (ok for sim)
+    fcnt_le = fcnt.to_bytes(2, "little")
+    fport = b"\x01"
+    enc = encrypt_frm(APP_SKEY, DEVADDR, plaintext, fcnt)
+    mac = DEVADDR[::-1] + fctrl + fcnt_le + fport + enc
+    m = mic(NWK_SKEY, DEVADDR, mhdr + mac, fcnt)
+    return mhdr + mac + m
+
+# ---------- Gateway (Semtech UDP) ----------
+def push_data(payload: dict):
+    token = secrets.token_bytes(2)
+    hdr = bytes([VER]) + token + bytes([PUSH_DATA]) + GATEWAY_EUI
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    if VERBOSE:
+        print("[GW VERBOSE] PUSH_DATA JSON ->")
+        print(json.dumps(payload, indent=2))
+    sock.sendto(hdr + body, (TTN_SERVER, PORT))
+
+def pull_data():
+    token = secrets.token_bytes(2)
+    hdr = bytes([VER]) + token + bytes([PULL_DATA]) + GATEWAY_EUI
+    sock.sendto(hdr, (TTN_SERVER, PORT))
+    if VERBOSE: print("[GW VERBOSE] PULL_DATA sent")
+
+def send_status():
+    payload = {"stat": {
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT"),
+        "lati": 23.0, "long": 72.0, "alti": 20, "rxnb": 0, "rxok": 0,
+        "rxfw": 0, "ackr": 0.0, "dwnb": 0, "txnb": 0
+    }}
+    push_data(payload)
+
+def send_uplink(frame_bytes: bytes, freq_mhz=None, datr=None):
+    freq = round(freq_mhz if freq_mhz else random.choice(FREQUENCIES_MHZ), 3)
+    datr = datr or DATARATE
+    rxpk = [{
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "tmst": int(time.time()*1_000_000) & 0xFFFFFFFF,
+        "chan": 0, "rfch": 0, "freq": freq, "stat": 1,
+        "modu": "LORA", "datr": datr, "codr": CODR,
+        "rssi": RSSI, "lsnr": LSNR, "size": len(frame_bytes),
+        "data": b64e(frame_bytes)
+    }]
+    push_data({"rxpk": rxpk})
+    print(f"[GW] Uplink sent freq={freq} datr={datr} size={len(frame_bytes)}")
+
+def recv_loop():
+    while True:
+        try:
+            data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        if len(data) < 4 or data[0] != VER: 
+            continue
+        ptype = data[3]
+        if ptype == PUSH_ACK:
+            print("[GW] PUSH_ACK (uplink acknowledged)")
+        elif ptype == PULL_ACK and VERBOSE:
+            print("[GW VERBOSE] PULL_ACK")
+        elif ptype == PULL_RESP:
+            # (ABP demo: ignore downlinks; still TX_ACK to be polite)
+            token = data[1:3]
+            sock.sendto(bytes([VER]) + token + bytes([TX_ACK]), (TTN_SERVER, PORT))
+
+def schedule_every(fn, sec):
+    def loop():
+        while True:
+            try: fn()
+            except Exception as e: print(f"[GW] periodic error: {e}")
+            time.sleep(sec)
+    threading.Thread(target=loop, daemon=True).start()
+
+# ---------- Main ----------
+def main():
+    # Start gateway background tasks
+    threading.Thread(target=recv_loop, daemon=True).start()
+    schedule_every(pull_data, 5)
+    schedule_every(send_status, 30)
+    print(f"[GW] Started. EUI={GATEWAY_EUI_HEX} -> {TTN_SERVER}:{PORT}")
+
+    # FCntUp: for ABP this must be persistent; we start at 0 for demo.
+    fcnt = 0
+
+    # Send one confirmed uplink first (optional), then periodic unconfirmed
+    first = True
+    while True:
+        fcnt = (fcnt + 1) & 0xFFFF
+        payload = f"temp:{25 + (fcnt % 5)}".encode()
+        frame = build_uplink(payload, fcnt, confirmed=first)
+        send_uplink(frame)
+        first = False
+        time.sleep(10)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n[Main] Stopped.")
