@@ -1,0 +1,118 @@
+import socket, json, time, base64, struct, secrets, threading
+from binascii import unhexlify, hexlify
+from Crypto.Cipher import AES
+
+# ================= USER CONFIG =================
+TTN_SERVER = "learningnetwork.m1s1.cloud.thethings.industries"
+PORT = 1700
+
+DEV_EUI_HEX  = "70B3D57ED0050B1"   # MSB from TTS
+JOIN_EUI_HEX = "1232456845624523"  # MSB from TTS
+APP_KEY_HEX  = "8D7C6E5B3A613ACE210E3F98223740D5"  # Your AppKey
+
+GATEWAY_EUI  = bytes.fromhex("0000000000000232")  # Simulated Gateway EUI
+FREQ_PLAN    = [922.0, 922.2, 922.4, 922.6, 922.8]  # AS923 example
+# =================================================
+
+def msb_to_lsb(msb_hex):
+    return bytes.fromhex(msb_hex)[::-1]
+
+DEV_EUI  = msb_to_lsb(DEV_EUI_HEX)
+JOIN_EUI = msb_to_lsb(JOIN_EUI_HEX)
+APP_KEY  = bytes.fromhex(APP_KEY_HEX)
+
+print(f"[INFO] DevEUI (MSB): {DEV_EUI_HEX}, LSB: {hexlify(DEV_EUI).decode()}")
+print(f"[INFO] JoinEUI(MSB): {JOIN_EUI_HEX}, LSB: {hexlify(JOIN_EUI).decode()}")
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2)
+
+_used_nonces = set()
+def next_nonce_unique():
+    while True:
+        dn = secrets.randbits(16)
+        if dn not in _used_nonces:
+            _used_nonces.add(dn)
+            return dn.to_bytes(2, "little")
+
+def lorawan_mic(data, key):
+    aes = AES.new(key, AES.MODE_ECB)
+    return aes.encrypt(data)[0:4]
+
+def build_join_request():
+    mhdr = b'\x00'  # Join-request
+    dev_nonce = next_nonce_unique()
+    mic_input = mhdr + JOIN_EUI + DEV_EUI + dev_nonce
+    mic = lorawan_mic(mic_input, APP_KEY)
+    return mhdr + JOIN_EUI + DEV_EUI + dev_nonce + mic
+
+def send_status():
+    payload = {
+        "stat": {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S GMT", time.gmtime()),
+            "rxnb": 0, "rxok": 0, "rxfw": 0, "ackr": 100.0,
+            "dwnb": 0, "txnb": 0
+        }
+    }
+    token = secrets.token_bytes(2)
+    pkt = b'\x02' + token + b'\x00' + GATEWAY_EUI + json.dumps(payload).encode()
+    sock.sendto(pkt, (TTN_SERVER, PORT))
+
+def send_pull_data():
+    token = secrets.token_bytes(2)
+    pkt = b'\x02' + token + b'\x02' + GATEWAY_EUI
+    sock.sendto(pkt, (TTN_SERVER, PORT))
+
+def send_uplink(payload_bytes):
+    freq = secrets.choice(FREQ_PLAN)
+    rxpk = [{
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S.000000Z", time.gmtime()),
+        "tmst": int(time.time()*1e6),
+        "chan": 0, "rfch": 0, "freq": freq,
+        "stat": 1, "modu": "LORA", "datr": "SF7BW125", "codr": "4/5",
+        "rssi": -30, "lsnr": 5.0,
+        "size": len(payload_bytes),
+        "data": base64.b64encode(payload_bytes).decode()
+    }]
+    payload = {"rxpk": rxpk}
+    token = secrets.token_bytes(2)
+    pkt = b'\x02' + token + b'\x00' + GATEWAY_EUI + json.dumps(payload).encode()
+    sock.sendto(pkt, (TTN_SERVER, PORT))
+    print(f"[GW] Uplink sent freq={freq} datr=SF7BW125 size={len(payload_bytes)}")
+
+def listen_for_downlink():
+    while True:
+        try:
+            data, _ = sock.recvfrom(4096)
+            if len(data) > 12 and data[3] == 0x03:  # PULL_RESP
+                payload = json.loads(data[12:].decode())
+                print(f"[GW] Downlink from TTS: {payload}")
+                if "txpk" in payload and "data" in payload["txpk"]:
+                    raw = base64.b64decode(payload["txpk"]["data"])
+                    if raw[0] & 0xE0 == 0x20:  # Join-accept (MHDR=0x20)
+                        print("[Device] ✅ Join-Accept received!")
+            elif len(data) > 3 and data[3] == 0x04:
+                print("[GW] PUSH_ACK (uplink acknowledged)")
+            elif len(data) > 3 and data[3] == 0x05:
+                print("[GW] PULL_ACK")
+        except socket.timeout:
+            continue
+
+def start_gateway():
+    threading.Thread(target=listen_for_downlink, daemon=True).start()
+    threading.Thread(target=lambda: loop_forever(send_pull_data, 5), daemon=True).start()
+    threading.Thread(target=lambda: loop_forever(send_status, 30), daemon=True).start()
+
+def loop_forever(fn, delay):
+    while True:
+        fn()
+        time.sleep(delay)
+
+if __name__ == "__main__":
+    start_gateway()
+    time.sleep(2)
+    join_payload = build_join_request()
+    print(f"[Device] JoinReq sent MIC={join_payload[-4:].hex()}")
+    send_uplink(join_payload)
+    while True:
+        time.sleep(60)
