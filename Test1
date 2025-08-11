@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# single_lorawan_sim_fixed.py
+# One file: Semtech UDP gateway + OTAA end device (LoRaWAN 1.0.x)
+# All config is inside this file. No environment variables used.
+
+import os, json, time, base64, socket, struct, threading, random
+from datetime import datetime, timezone
+from Crypto.Cipher import AES
+from Crypto.Hash import CMAC
+
+# =========================
+# EDIT ME: Configuration
+# =========================
+# --- TTS/TTN UDP router (your Azure host/IP) ---
+TTS_HOST   = "127.0.0.1"
+TTS_PORT   = 1700
+
+# --- Gateway identity (8-byte EUI hex, 16 hex chars) ---
+GATEWAY_EUI_HEX = "AA555A0000000001"
+
+# --- Device credentials ---
+DEV_EUI_HEX  = "70B3D57ED0052102"   # EUI-64 (MSB hex)
+JOIN_EUI_HEX = "0000000000000000"   # aka AppEUI (MSB hex)
+APP_KEY_HEX  = "8C963B0C26A3AC10AE12238F982237405B"  # 16-byte key (hex)
+
+# --- Radio / region (AS923 default channels). Change if needed ---
+FREQUENCIES_MHZ = [922.0, 922.2, 922.4, 922.6, 922.8, 923.0]
+DATARATE        = "SF7BW125"    # e.g., SF7BW125 (must be valid for your plan)
+CODR            = "4/5"
+RSSI            = -35
+LSNR            = 5.0
+
+# --- Logging ---
+VERBOSE = True  # set False for quieter output
+# =========================
+
+
+# =========================
+# Semtech UDP constants
+# =========================
+VER = 2
+PUSH_DATA = 0x00
+PUSH_ACK  = 0x01
+PULL_DATA = 0x02
+PULL_RESP = 0x03
+PULL_ACK  = 0x04
+TX_ACK    = 0x05
+
+# =========================
+# Gateway internals
+# =========================
+sock = None
+server = None
+running = False
+DOWNLINK_CB = None
+
+def gweui_bytes():
+    h = GATEWAY_EUI_HEX.replace(":", "").replace("-", "").lower()
+    if len(h) != 16:
+        raise ValueError("GATEWAY_EUI_HEX must be 16 hex chars (8 bytes)")
+    return bytes.fromhex(h)
+
+def tok(): return os.urandom(2)
+
+def sendto(b: bytes):
+    try:
+        sock.sendto(b, server)
+    except Exception as e:
+        print(f"[GW] send error: {e}")
+
+def b64d(s): return base64.b64decode(s + "===")
+def b64e(b): return base64.b64encode(b).decode("ascii")
+
+def mhdr_kind(mhdr: int):
+    m = (mhdr >> 5) & 0x7
+    return {0:"JoinRequest",1:"JoinAccept",2:"UnconfUp",3:"UnconfDown",
+            4:"ConfUp",5:"ConfDown",6:"RFU",7:"Prop"}.get(m,"?")
+
+def hexdump(buf: bytes, pfx="[HEX] "):
+    for i in range(0, len(buf), 16):
+        print(f"{pfx}{i:04x}: " + " ".join(f"{b:02X}" for b in buf[i:i+16]))
+
+def push_data(payload):
+    hdr = struct.pack(">B2sB", VER, tok(), PUSH_DATA) + gweui_bytes()
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    if VERBOSE:
+        print("[GW VERBOSE] PUSH_DATA JSON -> TTS")
+        print(json.dumps(payload, indent=2))
+    sendto(hdr + body)
+
+def pull_data():
+    hdr = struct.pack(">B2sB", VER, tok(), PULL_DATA) + gweui_bytes()
+    sendto(hdr)
+    if VERBOSE: print("[GW VERBOSE] PULL_DATA sent")
+
+def tx_ack(token: bytes):
+    hdr = struct.pack(">B2sB", VER, token, TX_ACK)
+    sendto(hdr)
+    if VERBOSE: print("[GW VERBOSE] TX_ACK sent")
+
+def recv_worker():
+    while running:
+        try:
+            data, _ = sock.recvfrom(65535)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            print(f"[GW] recv error: {e}"); continue
+        if len(data) < 4 or data[0] != VER:
+            continue
+        token = data[1:3]; ptype = data[3]
+        if ptype == PUSH_ACK:
+            print("[GW] PUSH_ACK (uplink acknowledged)")
+        elif ptype == PULL_ACK:
+            if VERBOSE: print("[GW VERBOSE] PULL_ACK")
+        elif ptype == PULL_RESP:
+            try:
+                js = json.loads(data[4:].decode())
+                b64 = js.get("txpk", {}).get("data")
+                if b64:
+                    raw = b64d(b64)
+                    print(f"[GW] Downlink received ({len(raw)} bytes)")
+                    if VERBOSE: hexdump(raw, "[GW VERBOSE] DL ")
+                    if DOWNLINK_CB: DOWNLINK_CB(raw)
+                    tx_ack(token)
+            except Exception as e:
+                print(f"[GW] PULL_RESP parse error: {e}")
+
+def loop_every(fn, sec):
+    while running:
+        try: fn()
+        except Exception as e: print(f"[GW] periodic error: {e}")
+        time.sleep(sec)
+
+def gateway_start(on_downlink):
+    global sock, server, running, DOWNLINK_CB
+    DOWNLINK_CB = on_downlink
+    server = (TTS_HOST, TTS_PORT)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.settimeout(1.0)
+    running = True
+    threading.Thread(target=recv_worker, daemon=True).start()
+    threading.Thread(target=loop_every, args=(pull_data, 5), daemon=True).start()
+    # status beacons
+    def send_status():
+        push_data({"stat":{
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT"),
+            "lati": 23.0, "long": 72.0, "alti": 20, "rxnb": 0, "rxok": 0,
+            "rxfw": 0, "ackr": 0.0, "dwnb": 0, "txnb": 0
+        }})
+    threading.Thread(target=loop_every, args=(send_status, 30), daemon=True).start()
+    print(f"[GW] Started. EUI={GATEWAY_EUI_HEX.upper()} -> {TTS_HOST}:{TTS_PORT}")
+
+def gateway_send_uplink(uplink_b64: str, freq_mhz=None, datr=None):
+    """Device calls this to forward a base64 LoRaWAN frame as PUSH_DATA/rxpk."""
+    try:
+        raw = b64d(uplink_b64)
+    except Exception as e:
+        print(f"[GW] invalid base64: {e}"); return
+    kind = mhdr_kind(raw[0] if raw else 0)
+    print(f"[GW] Uplink -> {kind} | {len(raw)} bytes")
+    if VERBOSE: hexdump(raw, "[GW VERBOSE] UL ")
+    freq = round(freq_mhz if freq_mhz else random.choice(FREQUENCIES_MHZ), 3)
+    datr = datr or DATARATE
+    rxpk = [{
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "tmst": int(time.time()*1_000_000) & 0xFFFFFFFF,
+        "chan": 0, "rfch": 0, "freq": freq, "stat": 1,
+        "modu": "LORA", "datr": datr, "codr": CODR,
+        "rssi": RSSI, "lsnr": LSNR, "size": len(raw), "data": uplink_b64
+    }]
+    push_data({"rxpk": rxpk})
+    print(f"[GW] Uplink sent freq={freq} datr={datr} size={len(raw)}")
+
+
+# =========================
+# Device (OTAA 1.0.x)
+# =========================
+def aes128_encrypt(key: bytes, block: bytes) -> bytes:
+    return AES.new(key, AES.MODE_ECB).encrypt(block)
+
+def cmac_digest(key: bytes, msg: bytes) -> bytes:
+    c = CMAC.new(key, ciphermod=AES); c.update(msg); return c.digest()
+
+class OtaaDevice:
+    def __init__(self, dev_eui_hex, join_eui_hex, app_key_hex):
+        self.dev_eui  = bytes.fromhex(dev_eui_hex)[::-1]     # LSB on-air
+        self.join_eui = bytes.fromhex(join_eui_hex)[::-1]
+        self.app_key  = bytes.fromhex(app_key_hex)
+        self.dev_nonce = 0
+        self.dev_addr  = None
+        self.nwk_skey  = None
+        self.app_skey  = None
+        self.fcnt      = 0
+
+    # --- Join ---
+    def next_devnonce(self):
+        self.dev_nonce = (self.dev_nonce + 1) & 0xFFFF
+        return self.dev_nonce.to_bytes(2, "little")
+
+    def build_join_request(self):
+        mhdr = b"\x00"
+        dn = self.next_devnonce()
+        msg = self.join_eui + self.dev_eui + dn
+        mic = cmac_digest(self.app_key, mhdr + msg)[:4]
+        frame = mhdr + msg + mic
+        print(f"[Device] JoinReq devnonce={dn.hex()} mic={mic.hex()}")
+        return base64.b64encode(frame).decode(), dn
+
+    def parse_join_accept(self, raw: bytes, devnonce: bytes):
+        if raw[0] >> 5 != 0x01:
+            print("[Device] Not JoinAccept"); return False
+        # decrypt 16B minimal payload (no CFList handling here)
+        dec = AES.new(self.app_key, AES.MODE_ECB).decrypt(raw[1:17])
+        app_nonce, net_id, devaddr_le = dec[0:3], dec[3:6], dec[6:10]
+        self.dev_addr = devaddr_le[::-1]
+        m1 = b"\x01" + app_nonce + net_id + devnonce + b"\x00"*7
+        m2 = b"\x02" + app_nonce + net_id + devnonce + b"\x00"*7
+        self.nwk_skey = aes128_encrypt(self.app_key, m1)
+        self.app_skey = aes128_encrypt(self.app_key, m2)
+        print(f"[Device] JoinAccept OK devaddr={self.dev_addr.hex().upper()}")
+        print(f"[Device] NwkSKey={self.nwk_skey.hex().upper()}")
+        print(f"[Device] AppSKey={self.app_skey.hex().upper()}")
+        return True
+
+    # --- Uplink ---
+    def _encrypt_frm(self, payload: bytes, fcnt: int) -> bytes:
+        out = bytearray(); cipher = AES.new(self.app_skey, AES.MODE_ECB)
+        i = 1; dev_le = self.dev_addr[::-1]
+        while len(out) < len(payload):
+            block_a = (b"\x01" + b"\x00"*4 + b"\x00" + dev_le +
+                       fcnt.to_bytes(4, "little") + b"\x00" + bytes([i]))
+            s = cipher.encrypt(block_a)
+            for b in payload[(i-1)*16:i*16]:
+                out.append(b ^ s[len(out) % 16])
+            i += 1
+        return bytes(out[:len(payload)])
+
+    def _mic(self, mhdr_mac: bytes, fcnt: int) -> bytes:
+        dev_le = self.dev_addr[::-1]
+        b0 = (b"\x49" + b"\x00"*4 + b"\x00" + dev_le +
+              fcnt.to_bytes(4, "little") + b"\x00" + bytes([len(mhdr_mac)]))
+        return cmac_digest(self.nwk_skey, b0 + mhdr_mac)[:4]
+
+    def build_data_uplink(self, text: str):
+        self.fcnt = (self.fcnt + 1) & 0xFFFF
+        mhdr = b"\x40"; fctrl = b"\x80"; fcnt_le = self.fcnt.to_bytes(2,"little"); fport=b"\x01"
+        enc = self._encrypt_frm(text.encode(), self.fcnt)
+        mac = self.dev_addr[::-1] + fctrl + fcnt_le + fport + enc
+        mic = self._mic(mhdr + mac, self.fcnt)
+        frame = mhdr + mac + mic
+        print(f"[Device] Uplink fcnt={self.fcnt} bytes={len(frame)}")
+        return base64.b64encode(frame).decode()
+
+
+# =========================
+# Wiring both sides
+# =========================
+device = OtaaDevice(DEV_EUI_HEX, JOIN_EUI_HEX, APP_KEY_HEX)
+_joined = False
+_last_dn = None
+
+def on_downlink(raw: bytes):
+    global _joined, _last_dn
+    if _joined: return
+    if device.parse_join_accept(raw, _last_dn):
+        _joined = True
+        threading.Thread(target=send_data_loop, daemon=True).start()
+
+def send_join_loop():
+    global _last_dn
+    while not _joined:
+        b64, dn = device.build_join_request()
+        _last_dn = dn
+        gateway_send_uplink(b64)
+        print("[Device] JoinReq sent")
+        time.sleep(5)
+
+def send_data_loop():
+    while True:
+        payload = f"temp:{25 + (device.fcnt % 5)},freq:{FREQUENCIES_MHZ[0]:.1f}"
+        b64 = device.build_data_uplink(payload)
+        gateway_send_uplink(b64)
+        time.sleep(10)
+
+# =========================
+# Main
+# =========================
+def gateway_start(on_downlink):
+    # (wrapper kept for readability—already defined above)
+    gateway_start_impl(on_downlink)
+
+def gateway_start_impl(on_downlink):
+    # Use the start defined earlier (avoids reordering confusion)
+    global sock, server, running, DOWNLINK_CB
+    DOWNLINK_CB = on_downlink
+    server = (TTS_HOST, TTS_PORT)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("0.0.0.0", 0))
+    sock.settimeout(1.0)
+    running = True
+    threading.Thread(target=recv_worker, daemon=True).start()
+    threading.Thread(target=loop_every, args=(pull_data, 5), daemon=True).start()
+    def send_status():
+        push_data({"stat":{
+            "time": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT"),
+            "lati": 23.0, "long": 72.0, "alti": 20, "rxnb": 0, "rxok": 0,
+            "rxfw": 0, "ackr": 0.0, "dwnb": 0, "txnb": 0
+        }})
+    threading.Thread(target=loop_every, args=(send_status, 30), daemon=True).start()
+    print(f"[GW] Started. EUI={GATEWAY_EUI_HEX.upper()} -> {TTS_HOST}:{TTS_PORT}")
+
+def gateway_send_uplink(uplink_b64: str, freq_mhz=None, datr=None):
+    # (wrapper kept for clarity—already defined above)
+    gateway_send_uplink_impl(uplink_b64, freq_mhz, datr)
+
+def gateway_send_uplink_impl(uplink_b64: str, freq_mhz=None, datr=None):
+    try:
+        raw = b64d(uplink_b64)
+    except Exception as e:
+        print(f"[GW] invalid base64: {e}"); return
+    kind = mhdr_kind(raw[0] if raw else 0)
+    print(f"[GW] Uplink -> {kind} | {len(raw)} bytes")
+    if VERBOSE: hexdump(raw, "[GW VERBOSE] UL ")
+    freq = round(freq_mhz if freq_mhz else random.choice(FREQUENCIES_MHZ), 3)
+    datr = datr or DATARATE
+    rxpk = [{
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "tmst": int(time.time()*1_000_000) & 0xFFFFFFFF,
+        "chan": 0, "rfch": 0, "freq": freq, "stat": 1,
+        "modu": "LORA", "datr": datr, "codr": CODR,
+        "rssi": RSSI, "lsnr": LSNR, "size": len(raw), "data": uplink_b64
+    }]
+    push_data({"rxpk": rxpk})
+    print(f"[GW] Uplink sent freq={freq} datr={datr} size={len(raw)}")
+
+if __name__ == "__main__":
+    print("[Main] Starting gateway…")
+    gateway_start_impl(on_downlink)
+    print("[Main] Starting OTAA…")
+    send_join_loop()
