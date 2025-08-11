@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-# lorawan_abp_persist.py
+# lorawan_abp_temp.py
 # One file: Semtech UDP gateway + ABP end-device (LoRaWAN 1.0.x)
-# - Persists FCntUp across restarts
-# - Region presets
-# - Verbose debug (MIC, FCnt, keys)
+# Sends temperature payload as int16 (°C * 100) on FPort=1, persists FCntUp.
 
-import socket, json, time, base64, secrets, threading, random, os
+import socket, json, time, base64, secrets, threading, random, os, math
 from datetime import datetime, timezone
 from binascii import hexlify
 from Crypto.Cipher import AES
 from Crypto.Hash import CMAC
+import struct
 
 # ===================== USER CONFIG =====================
 TTN_SERVER = "learningnetwork.ms1.cloud.thethings.industries"
@@ -18,34 +17,31 @@ PORT       = 1700
 # Gateway EUI (MSB, 16 hex chars)
 GATEWAY_EUI_HEX = "0004A30B001CC532"
 
-# ---- ABP session credentials (MSB as shown in TTS) ----
+# ---- ABP device session credentials (MSB, as in TTS) ----
 DEVADDR_HEX  = "260B1234"                                    # 4 bytes
 NWK_SKEY_HEX = "11223344556677889900AABBCCDDEEFF"            # 16 bytes
 APP_SKEY_HEX = "FFEEDDCCBBAA00998877665544332211"            # 16 bytes
 
 # Region preset: "AS923-1", "IN865", "EU868", "US915"
 REGION = "AS923-1"
-DATARATE = "SF7BW125"      # keep unless you know you need a different DR
+DATARATE = "SF7BW125"
 CODR = "4/5"
 RSSI, LSNR = -35, 5.0
 VERBOSE = True
-SEND_CONFIRMED_FIRST = True   # first uplink confirmed, then unconfirmed
+SEND_CONFIRMED_FIRST = True
 UPLINK_PERIOD_SEC = 10
 # =======================================================
 
-# ----- region presets (uplink freqs only, examples) -----
 REGION_FREQS = {
     "AS923-1": [922.0, 922.2, 922.4, 922.6, 922.8, 923.0],
     "IN865":   [865.0625, 865.4025, 865.985],
     "EU868":   [868.1, 868.3, 868.5],
-    "US915":   [902.3, 902.5, 902.7, 902.9, 903.1, 903.3, 903.5, 903.7]  # 8ch example
+    "US915":   [902.3, 902.5, 902.7, 902.9, 903.1, 903.3, 903.5, 903.7]
 }
 FREQUENCIES_MHZ = REGION_FREQS.get(REGION, REGION_FREQS["AS923-1"])
 
-# ---------- helpers ----------
 def b64e(b): return base64.b64encode(b).decode("ascii")
-def b64d(s): return base64.b64decode(s + "===")
-def to_bytes(hexstr): return bytes.fromhex(hexstr)
+def to_bytes(h): return bytes.fromhex(h)
 
 GATEWAY_EUI = to_bytes(GATEWAY_EUI_HEX)
 DEVADDR     = to_bytes(DEVADDR_HEX)
@@ -55,8 +51,8 @@ APP_SKEY    = to_bytes(APP_SKEY_HEX)
 print(f"[INFO] Region={REGION}  DR={DATARATE}")
 print(f"[INFO] DevAddr={DEVADDR_HEX}  NwkSKey={NWK_SKEY_HEX}  AppSKey={APP_SKEY_HEX}")
 
-# UDP + Semtech UDP constants
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(2.0)
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+sock.settimeout(2.0)
 VER=2; PUSH_DATA=0x00; PUSH_ACK=0x01; PULL_DATA=0x02; PULL_RESP=0x03; PULL_ACK=0x04; TX_ACK=0x05
 
 # ---------- FCntUp persistence ----------
@@ -71,7 +67,20 @@ def save_fcnt(v):
     except Exception as e:
         print(f"[WARN] Could not persist FCntUp: {e}")
 
-# ---------- LoRaWAN payload building (ABP) ----------
+# ---------- Temperature encoding ----------
+def read_temperature():
+    """Simulated temperature in °C (replace with real sensor if you have one)."""
+    t = time.time()
+    base = 26.0 + 0.5*math.sin(t/180)      # slow wiggle
+    noise = random.uniform(-0.15, 0.15)    # small noise
+    return round(base + noise, 2)
+
+def encode_temp_centi(temp_c: float) -> bytes:
+    """Return 2 bytes: signed int16 = °C * 100."""
+    val = int(round(temp_c * 100))
+    return struct.pack("<h", val)          # little-endian int16
+
+# ---------- LoRaWAN helpers (ABP) ----------
 def encrypt_frm(app_skey: bytes, dev_addr: bytes, payload: bytes, fcnt: int) -> bytes:
     out = bytearray(); cipher = AES.new(app_skey, AES.MODE_ECB)
     i = 1; dev_le = dev_addr[::-1]
@@ -91,16 +100,15 @@ def mic(nwk_skey: bytes, dev_addr: bytes, mhdr_mac: bytes, fcnt: int) -> bytes:
     c = CMAC.new(nwk_skey, ciphermod=AES); c.update(b0 + mhdr_mac)
     return c.digest()[:4]
 
-def build_uplink(plaintext: bytes, fcnt: int, confirmed=False) -> tuple[bytes, bytes]:
+def build_uplink(payload_bytes: bytes, fcnt: int, confirmed=False, fport: int = 1) -> tuple[bytes, bytes]:
     mhdr = b"\x80" if confirmed else b"\x40"     # Confirmed/Unconfirmed Data Up
     fctrl = b"\x80"                               # ADR bit set (ok for sim)
     fcnt_le = fcnt.to_bytes(2, "little")
-    fport = b"\x01"
-    enc = encrypt_frm(APP_SKEY, DEVADDR, plaintext, fcnt)
-    mac = DEVADDR[::-1] + fctrl + fcnt_le + fport + enc
+    fport_b = bytes([fport])
+    enc = encrypt_frm(APP_SKEY, DEVADDR, payload_bytes, fcnt)
+    mac = DEVADDR[::-1] + fctrl + fcnt_le + fport_b + enc
     m = mic(NWK_SKEY, DEVADDR, mhdr + mac, fcnt)
-    frame = mhdr + mac + m
-    return frame, m
+    return mhdr + mac + m, m
 
 # ---------- Gateway (Semtech UDP) ----------
 def push_data(payload: dict):
@@ -146,7 +154,7 @@ def recv_loop():
             data, _ = sock.recvfrom(65535)
         except socket.timeout:
             continue
-        if len(data) < 4 or data[0] != VER:
+        if len(data) < 4 or data[0] != VER: 
             continue
         ptype = data[3]
         if ptype == PUSH_ACK:
@@ -168,7 +176,6 @@ def schedule_every(fn, sec):
 
 # ---------- Main ----------
 def main():
-    # Start gateway background tasks
     threading.Thread(target=recv_loop, daemon=True).start()
     schedule_every(pull_data, 5)
     schedule_every(send_status, 30)
@@ -179,17 +186,18 @@ def main():
 
     confirmed = SEND_CONFIRMED_FIRST
     while True:
-        fcnt = (fcnt + 1) & 0xFFFFFFFF  # keep 32-bit local counter
-        upl_text = f"temp:{25 + (fcnt % 5)}".encode()
-        frame, mic_val = build_uplink(upl_text, fcnt & 0xFFFF, confirmed=confirmed)
-        print(f"[DEV] Uplink FCntUp={fcnt} (LoRaWAN {fcnt & 0xFFFF}) "
-              f"MIC={hexlify(mic_val).decode().upper()} DR={DATARATE}")
+        fcnt = (fcnt + 1) & 0xFFFFFFFF
+        temp_c = read_temperature()
+        payload = encode_temp_centi(temp_c)          # **2 bytes**
+        frame, mic_val = build_uplink(payload, fcnt & 0xFFFF, confirmed=confirmed, fport=1)
+        print(f"[DEV] Temp={temp_c:.2f} °C  FCntUp={fcnt}  MIC={hexlify(mic_val).decode().upper()} DR={DATARATE}")
         send_uplink(frame)
         save_fcnt(fcnt)
         confirmed = False
         time.sleep(UPLINK_PERIOD_SEC)
 
 if __name__ == "__main__":
+    from datetime import datetime, timezone
     try:
         main()
     except KeyboardInterrupt:
