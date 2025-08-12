@@ -1,41 +1,38 @@
 #!/usr/bin/env python3
-# otaa_as923_temp_full.py
-# OTAA (AS923-1) join -> derive session keys -> periodic temperature uplinks
-# Gateway + device in one process (Semtech UDP simulator)
+# otaa_resume_or_join.py
+# If session file exists -> resume and send; else -> OTAA join then send.
 
 import socket, json, time, base64, secrets, threading, random, math, struct, os
 from datetime import datetime, timezone
-from binascii import hexlify
 from Crypto.Cipher import AES
 from Crypto.Hash import CMAC
 
-# ==================== EDIT ME ====================
+# ==================== CONFIG (EDIT) ====================
 TTN_SERVER = "learningnetwork.ms1.cloud.thethings.industries"
 PORT       = 1700
-GATEWAY_EUI_HEX = "0004A30B001CC532"            # 8-byte EUI (MSB)
+GATEWAY_EUI_HEX = "0004A30B001CC532"            # MSB
 
 # Device credentials (MSB exactly as in TTS)
 DEV_EUI_HEX  = "70B3D57ED0050B1"
 JOIN_EUI_HEX = "1232456845624523"
 APP_KEY_HEX  = "8D7C6E5B3A613ACE210E3F98223740D5"
 
-# AS923-1 join (fixes "uplink channel not found")
+# Region: AS923-1
 JOIN_FREQS_MHZ = [923.2, 923.4, 923.6]
-JOIN_DATARATE  = "SF10BW125"                    # use "SF9BW125" if your tenant expects DR3
-
-# After join (AS923-1 data channels/DR)
+JOIN_DATARATE  = "SF10BW125"                    # or "SF9BW125"
 DATA_FREQS_MHZ = [923.2, 923.4, 923.6, 923.8, 924.0, 924.2, 924.4, 924.6]
-DATA_DATARATE  = "SF7BW125"                     # typical application DR
+DATA_DATARATE  = "SF7BW125"
 
-UPLINK_PERIOD_SEC = 10
-PERSIST_FCNT = True
-VERBOSE = True
-# ==================================================
+PERIOD_SEC   = 10.0                              # send every 10s
+STATE_FILE   = "lorawan_session.json"            # persisted session
+VERBOSE      = True
+# ======================================================
 
-# ---------- helpers ----------
+# ---- helpers ----
 def msb_to_lsb(h): return bytes.fromhex(h)[::-1]
-def b64e(b): return base64.b64encode(b).decode("ascii")
+def b64e(b): return base64.b64encode(b).decode()
 def b64d(s): return base64.b64decode(s + "===")
+def cmac(key, msg): c=CMAC.new(key, ciphermod=AES); c.update(msg); return c.digest()
 
 GATEWAY_EUI = bytes.fromhex(GATEWAY_EUI_HEX)
 DEV_EUI  = msb_to_lsb(DEV_EUI_HEX)
@@ -45,20 +42,34 @@ APP_KEY  = bytes.fromhex(APP_KEY_HEX)
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(2.0)
 VER=2; PUSH_DATA=0x00; PUSH_ACK=0x01; PULL_DATA=0x02; PULL_RESP=0x03; PULL_ACK=0x04; TX_ACK=0x05
 
-def log(*a): print(*a)
+# ---- persistent session ----
+session = {"devaddr": None, "nwk_skey": None, "app_skey": None, "fcnt_up": 0}
+def load_session():
+    try:
+        with open(STATE_FILE) as f: s=json.load(f)
+        for k in ("devaddr","nwk_skey","app_skey","fcnt_up"):
+            if k not in s: return False
+        session.update(s)
+        print("[STATE] loaded:", session)
+        return True
+    except: return False
 
-# ---------- gateway side ----------
+def save_session():
+    with open(STATE_FILE,"w") as f: json.dump(session,f)
+    if VERBOSE: print("[STATE] saved:", session)
+
+# ---- gateway I/O ----
 def push_data(payload):
     token = secrets.token_bytes(2)
     hdr = bytes([VER]) + token + bytes([PUSH_DATA]) + GATEWAY_EUI
-    body = json.dumps(payload, separators=(",", ":")).encode()
+    body = json.dumps(payload, separators=(",",":")).encode()
     sock.sendto(hdr + body, (TTN_SERVER, PORT))
     if VERBOSE and "rxpk" in payload:
-        print("[GW] PUSH_DATA rxpk ->", payload["rxpk"][0]["freq"], payload["rxpk"][0]["datr"])
+        p=payload["rxpk"][0]; print(f"[GW] PUSH_DATA -> {p['freq']} {p['datr']} len={p['size']}")
 
 def pull_data():
     token = secrets.token_bytes(2)
-    sock.sendto(bytes([VER]) + token + bytes([PULL_DATA]) + GATEWAY_EUI, (TTN_SERVER, PORT))
+    sock.sendto(bytes([VER])+token+bytes([PULL_DATA])+GATEWAY_EUI, (TTN_SERVER, PORT))
 
 def schedule_every(fn, sec):
     def loop():
@@ -68,10 +79,157 @@ def schedule_every(fn, sec):
             time.sleep(sec)
     threading.Thread(target=loop, daemon=True).start()
 
-def send_rxpk(frame_bytes: bytes, freq_mhz: float, datr: str):
+def send_rxpk(frame, freq_mhz, datr):
     rxpk=[{
         "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "tmst": int(time.time()*1_000_000) & 0xFFFFFFFF,
+        "chan": 0, "rfch": 0, "freq": round(freq_mhz,4), "stat": 1,
+        "modu": "LORA", "datr": datr, "codr": "4/5",
+        "rssi": -35, "lsnr": 5.0, "size": len(frame), "data": b64e(frame)
+    }]
+    push_data({"rxpk": rxpk})
+
+# ---- OTAA (1.0.x) ----
+_used_dn=set()
+def next_devnonce():
+    while True:
+        x=secrets.randbits(16)
+        if x not in _used_dn:
+            _used_dn.add(x); return x.to_bytes(2,"little")
+
+def build_join_request():
+    mhdr=b"\x00"; dn=next_devnonce()
+    msg=mhdr + JOIN_EUI + DEV_EUI + dn
+    mic=cmac(APP_KEY,msg)[:4]
+    return msg+mic, dn
+
+def derive_session_keys(app_key, app_nonce, net_id, dev_nonce):
+    cipher=AES.new(app_key, AES.MODE_ECB)
+    nblk=bytes([0x01])+app_nonce+net_id+dev_nonce+bytes(7)
+    ablk=bytes([0x02])+app_nonce+net_id+dev_nonce+bytes(7)
+    return cipher.encrypt(nblk), cipher.encrypt(ablk)
+
+def parse_join_accept(raw, dev_nonce):
+    if (raw[0]>>5)!=1: return None
+    dec=AES.new(APP_KEY,AES.MODE_ECB).decrypt(raw[1:17])
+    app_nonce, net_id, devaddr_le = dec[0:3], dec[3:6], dec[6:10]
+    devaddr = devaddr_le[::-1]  # MSB
+    nwk_skey, app_skey = derive_session_keys(APP_KEY, app_nonce, net_id, dev_nonce)
+    session.update({
+        "devaddr": devaddr.hex().upper(),
+        "nwk_skey": nwk_skey.hex().upper(),
+        "app_skey": app_skey.hex().upper(),
+        "fcnt_up": 0
+    })
+    save_session()
+    print(f"[JOIN] accepted DevAddr={session['devaddr']}")
+    return devaddr, nwk_skey, app_skey
+
+# ---- data uplink helpers ----
+def enc_frm(app_skey, devaddr, payload, fcnt16):
+    out=bytearray(); c=AES.new(app_skey,AES.MODE_ECB); i=1; dev_le=devaddr[::-1]
+    while len(out)<len(payload):
+        block=(b"\x01"+b"\x00"*4+b"\x00"+dev_le+fcnt16.to_bytes(4,"little")+b"\x00"+bytes([i]))
+        s=c.encrypt(block)
+        for b in payload[(i-1)*16:i*16]: out.append(b ^ s[len(out)%16])
+        i+=1
+    return bytes(out[:len(payload)])
+
+def data_mic(nwk_skey, devaddr, mhdr_mac, fcnt16):
+    dev_le=devaddr[::-1]
+    b0=(b"\x49"+b"\x00"*4+b"\x00"+dev_le+fcnt16.to_bytes(4,"little")+b"\x00"+bytes([len(mhdr_mac)]))
+    return cmac(nwk_skey, b0+mhdr_mac)[:4]
+
+def read_temp():
+    t=time.time(); return round(26.0+0.5*math.sin(t/180)+random.uniform(-0.15,0.15),2)
+
+def enc_temp_bytes(c):
+    v=int(round(c*100)); return struct.pack("<h", v)
+
+# ---- globals updated at runtime ----
+joined=False
+devaddr=None; nwk_skey=None; app_skey=None
+last_dn=b"\x00\x00"
+
+# ---- RX loop (handles Join-Accept) ----
+def recv_loop():
+    global joined, devaddr, nwk_skey, app_skey
+    while True:
+        try: data,_=sock.recvfrom(65535)
+        except socket.timeout: continue
+        if len(data)<4 or data[0]!=VER: continue
+        t=data[3]
+        if t==PULL_RESP:
+            js=json.loads(data[4:].decode()); b64=js.get("txpk",{}).get("data")
+            if not b64: continue
+            raw=b64d(b64)
+            parsed = parse_join_accept(raw, last_dn)
+            if parsed:
+                token=data[1:3]; sock.sendto(bytes([VER])+token+bytes([TX_ACK]),(TTN_SERVER,PORT))
+                devaddr, nwk_skey, app_skey = parsed; joined=True
+        elif t==PUSH_ACK and VERBOSE: print("[GW] PUSH_ACK")
+        elif t==PULL_ACK and VERBOSE: print("[GW] PULL_ACK")
+
+# ---- send loops ----
+def data_loop_exact10s():
+    global joined, devaddr, nwk_skey, app_skey
+    # Try to resume session first
+    if load_session():
+        devaddr  = bytes.fromhex(session["devaddr"])
+        nwk_skey = bytes.fromhex(session["nwk_skey"])
+        app_skey = bytes.fromhex(session["app_skey"])
+        joined = True
+        print("[BOOT] Session found -> skipping join.")
+    fcnt32 = int(session["fcnt_up"]) if session["fcnt_up"] else 0
+
+    next_t = time.monotonic()
+    while True:
+        if not joined:
+            time.sleep(0.2); next_t = time.monotonic(); continue
+
+        fcnt32 = (fcnt32 + 1) & 0xFFFFFFFF
+        session["fcnt_up"] = fcnt32; save_session()
+        fcnt16 = fcnt32 & 0xFFFF
+
+        temp = read_temp()
+        payload = enc_temp_bytes(temp)
+        mhdr=b"\x40"; fctrl=b"\x80"; fcnt_le=fcnt16.to_bytes(2,"little"); fport=b"\x01"
+        enc = enc_frm(app_skey, devaddr, payload, fcnt16)
+        mac = devaddr[::-1]+fctrl+fcnt_le+fport+enc
+        mic = data_mic(nwk_skey, devaddr, mhdr+mac, fcnt16)
+        frame = mhdr+mac+mic
+        freq = random.choice(DATA_FREQS_MHZ)
+        send_rxpk(frame, freq, DATA_DATARATE)
+        print(f"[UP] temp={temp:.2f}°C FCntUp={fcnt32} freq={freq} DR={DATA_DATARATE}")
+
+        next_t += PERIOD_SEC
+        time.sleep(max(0, next_t - time.monotonic()))
+
+def join_loop_if_needed():
+    global last_dn
+    # Only run join loop if no session file exists
+    if load_session():
+        return  # already handled in data loop
+    while not joined:
+        frame, dn = build_join_request(); last_dn=dn
+        freq=random.choice(JOIN_FREQS_MHZ)
+        send_rxpk(frame, freq, JOIN_DATARATE)
+        time.sleep(5)
+
+# ---- main ----
+def main():
+    threading.Thread(target=recv_loop, daemon=True).start()
+    schedule_every(pull_data, 5)
+    schedule_every(lambda: push_data({"stat":{"time":datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT")}}), 30)
+    print(f"[GW] Started. Router={TTN_SERVER}:{PORT}  EUI={GATEWAY_EUI_HEX}")
+
+    threading.Thread(target=data_loop_exact10s, daemon=True).start()
+    join_loop_if_needed()
+
+if __name__ == "__main__":
+    import math, struct
+    try: main()
+    except KeyboardInterrupt: print("\n[Main] Stopped.")        "tmst": int(time.time()*1_000_000) & 0xFFFFFFFF,
         "chan": 0, "rfch": 0, "freq": round(freq_mhz, 4), "stat": 1,
         "modu": "LORA", "datr": datr, "codr": "4/5",
         "rssi": -35, "lsnr": 5.0, "size": len(frame_bytes),
