@@ -1,0 +1,209 @@
+#!/usr/bin/env python3
+# otaa_as923_temp.py — OTAA join + periodic temperature uplinks (AS923‑1)
+
+import socket, json, time, base64, secrets, threading, random, math, struct, os
+from datetime import datetime, timezone
+from binascii import hexlify
+from Crypto.Cipher import AES
+from Crypto.Hash import CMAC
+
+# ==================== EDIT ME ====================
+TTN_SERVER = "learningnetwork.ms1.cloud.thethings.industries"
+PORT       = 1700
+GATEWAY_EUI_HEX = "0004A30B001CC532"        # 8‑byte EUI (MSB)
+
+# Device credentials (MSB exactly as in TTS)
+DEV_EUI_HEX  = "70B3D57ED0050B1"
+JOIN_EUI_HEX = "1232456845624523"
+APP_KEY_HEX  = "8D7C6E5B3A613ACE210E3F98223740D5"
+
+# AS923‑1 join (fixes “uplink channel not found”)
+JOIN_FREQS_MHZ = [923.2, 923.4, 923.6]
+JOIN_DATARATE  = "SF10BW125"                 # use "SF9BW125" if your tenant expects DR3
+
+# Uplink after join
+DATA_FREQS_MHZ = [923.2, 923.4, 923.6]       # safe AS923‑1 default set
+DATA_DATARATE  = "SF7BW125"                  # typical app DR
+UPLINK_PERIOD_SEC = 10
+PERSIST_FCNT = True                          # persist FCntUp across restarts
+# ==================================================
+
+# --- helpers ---
+def msb_to_lsb(h): return bytes.fromhex(h)[::-1]
+def b64e(b): return base64.b64encode(b).decode("ascii")
+def b64d(s): return base64.b64decode(s + "===")
+
+GATEWAY_EUI = bytes.fromhex(GATEWAY_EUI_HEX)
+DEV_EUI  = msb_to_lsb(DEV_EUI_HEX)
+JOIN_EUI = msb_to_lsb(JOIN_EUI_HEX)
+APP_KEY  = bytes.fromhex(APP_KEY_HEX)
+
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); sock.settimeout(2.0)
+VER=2; PUSH_DATA=0x00; PUSH_ACK=0x01; PULL_DATA=0x02; PULL_RESP=0x03; PULL_ACK=0x04; TX_ACK=0x05
+
+# ---------- gateway io ----------
+def push_data(payload):
+    token = secrets.token_bytes(2)
+    hdr = bytes([VER]) + token + bytes([PUSH_DATA]) + GATEWAY_EUI
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    sock.sendto(hdr + body, (TTN_SERVER, PORT))
+
+def pull_data():
+    token = secrets.token_bytes(2)
+    sock.sendto(bytes([VER]) + token + bytes([PULL_DATA]) + GATEWAY_EUI, (TTN_SERVER, PORT))
+
+def schedule_every(fn, sec):
+    def loop():
+        while True:
+            try: fn()
+            except Exception as e: print("[GW] periodic error:", e)
+            time.sleep(sec)
+    threading.Thread(target=loop, daemon=True).start()
+
+def send_rxpk(frame_bytes: bytes, freq_mhz: float, datr: str):
+    rxpk=[{
+        "time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "tmst": int(time.time()*1_000_000) & 0xFFFFFFFF,
+        "chan": 0, "rfch": 0, "freq": round(freq_mhz, 4), "stat": 1,
+        "modu": "LORA", "datr": datr, "codr": "4/5",
+        "rssi": -35, "lsnr": 5.0, "size": len(frame_bytes),
+        "data": b64e(frame_bytes)
+    }]
+    push_data({"rxpk": rxpk})
+
+# ---------- OTAA (1.0.x) ----------
+_used_dnonce=set()
+def next_devnonce():
+    while True:
+        x=secrets.randbits(16)
+        if x not in _used_dnonce:
+            _used_dnonce.add(x); return x.to_bytes(2,"little")
+
+def cmac(key, msg):
+    c=CMAC.new(key, ciphermod=AES); c.update(msg); return c.digest()
+
+def build_join_request():
+    mhdr=b"\x00"
+    dn = next_devnonce()
+    msg = mhdr + JOIN_EUI + DEV_EUI + dn
+    mic = cmac(APP_KEY, msg)[:4]
+    frame = msg + mic
+    print(f"[Join] devnonce={dn.hex()} mic={mic.hex()} freq/dr will vary")
+    return frame, dn
+
+def parse_join_accept(raw: bytes, dev_nonce: bytes):
+    if (raw[0]>>5)!=1: return None
+    dec = AES.new(APP_KEY, AES.MODE_ECB).decrypt(raw[1:17])
+    app_nonce, net_id, devaddr_le = dec[0:3], dec[3:6], dec[6:10]
+    devaddr = devaddr_le[::-1]
+    def s_key(prefix):
+        material = bytes([prefix]) + app_nonce + net_id + dev_nonce + b"\x00"*7
+        return AES.new(APP_KEY, AES.MODE_ECB).encrypt(material)
+    nwk_skey = s_key(0x01); app_skey = s_key(0x02)
+    print(f"[Join] ✅ accept DevAddr={devaddr.hex().upper()}")
+    return devaddr, nwk_skey, app_skey
+
+# ---------- data uplinks ----------
+def enc_frmpayload(app_skey, devaddr, payload, fcnt):
+    out=bytearray(); cipher=AES.new(app_skey, AES.MODE_ECB); i=1; dev_le=devaddr[::-1]
+    while len(out)<len(payload):
+        block=(b"\x01"+b"\x00"*4+b"\x00"+dev_le+fcnt.to_bytes(4,"little")+b"\x00"+bytes([i]))
+        s=cipher.encrypt(block)
+        for b in payload[(i-1)*16:i*16]: out.append(b ^ s[len(out)%16])
+        i+=1
+    return bytes(out[:len(payload)])
+
+def data_mic(nwk_skey, devaddr, mhdr_mac, fcnt):
+    dev_le=devaddr[::-1]
+    b0=(b"\x49"+b"\x00"*4+b"\x00"+dev_le+fcnt.to_bytes(4,"little")+b"\x00"+bytes([len(mhdr_mac)]))
+    return cmac(nwk_skey, b0+mhdr_mac)[:4]
+
+def read_temperature():
+    # simple simulated temp; replace with your sensor code
+    t=time.time()
+    base=26.0+0.5*math.sin(t/180)
+    noise=random.uniform(-0.15,0.15)
+    return round(base+noise,2)
+
+def encode_temp_centi(temp_c: float) -> bytes:
+    val=int(round(temp_c*100))
+    return struct.pack("<h", val)  # int16 little‑endian
+
+# ---------- app flow ----------
+joined=False
+last_dn=b"\x00\x00"
+devaddr=None; nwk_skey=None; app_skey=None
+fcnt=0
+FCNT_FILE="fcntup_otaa.txt"
+
+def load_fcnt():
+    if not PERSIST_FCNT: return 0
+    try: return int(open(FCNT_FILE).read().strip())
+    except: return 0
+
+def save_fcnt(v):
+    if not PERSIST_FCNT: return
+    try: open(FCNT_FILE,"w").write(str(v))
+    except: pass
+
+def recv_loop():
+    global joined, devaddr, nwk_skey, app_skey
+    while True:
+        try: data,_=sock.recvfrom(65535)
+        except socket.timeout: continue
+        if len(data)<4 or data[0]!=VER: continue
+        t=data[3]
+        if t==PUSH_ACK: print("[GW] PUSH_ACK")
+        elif t==PULL_ACK: print("[GW] PULL_ACK")
+        elif t==PULL_RESP:
+            js=json.loads(data[4:].decode()); b64=js.get("txpk",{}).get("data")
+            if not b64: continue
+            raw=b64d(b64)
+            parsed = parse_join_accept(raw, last_dn)
+            if parsed:
+                token=data[1:3]
+                sock.sendto(bytes([VER])+token+bytes([TX_ACK]),(TTN_SERVER,PORT))
+                devaddr, nwk_skey, app_skey = parsed
+                joined=True
+
+def send_data_loop():
+    global fcnt
+    fcnt = load_fcnt()
+    while True:
+        if not joined:
+            time.sleep(1); continue
+        fcnt = (fcnt + 1) & 0xFFFFFFFF
+        temp = read_temperature()
+        pl = encode_temp_centi(temp)            # 2 bytes
+        mhdr=b"\x40"; fctrl=b"\x80"; fcnt_le=(fcnt & 0xFFFF).to_bytes(2,"little"); fport=b"\x01"
+        enc = enc_frmpayload(app_skey, devaddr, pl, fcnt & 0xFFFF)
+        mac = devaddr[::-1]+fctrl+fcnt_le+fport+enc
+        mic = data_mic(nwk_skey, devaddr, mhdr+mac, fcnt & 0xFFFF)
+        frame = mhdr+mac+mic
+        freq=random.choice(DATA_FREQS_MHZ)
+        send_rxpk(frame, freq, DATA_DATARATE)
+        save_fcnt(fcnt)
+        print(f"[UP] temp={temp:.2f}°C  FCntUp={fcnt}  freq={freq} DR={DATA_DATARATE}")
+        time.sleep(UPLINK_PERIOD_SEC)
+
+def send_join_loop():
+    global last_dn
+    while not joined:
+        frame, dn = build_join_request(); last_dn=dn
+        freq=random.choice(JOIN_FREQS_MHZ)
+        send_rxpk(frame, freq, JOIN_DATARATE)
+        time.sleep(5)
+
+def main():
+    # start gateway background
+    threading.Thread(target=recv_loop, daemon=True).start()
+    schedule_every(pull_data, 5)
+    schedule_every(lambda: push_data({"stat":{"time":datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S GMT")}}), 30)
+    print(f"[GW] Started. EUI={GATEWAY_EUI_HEX}  Router={TTN_SERVER}:{PORT}")
+    # start data loop (will wait until 'joined' becomes True)
+    threading.Thread(target=send_data_loop, daemon=True).start()
+    # keep sending joins until accepted
+    send_join_loop()
+
+if __name__=="__main__":
+    main()
